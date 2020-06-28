@@ -1,0 +1,188 @@
+###运行环境：python3.7.4,tensorflow 1.15.0,keras 2.2.4
+class RandomWeightedAverage(_Merge):
+    """Provides a (random) weighted average between real and generated image samples"""
+    def _merge_function(self, inputs):
+        alpha = K.random_uniform((256, 1)) 
+        return (alpha * inputs[0]) + ((1 - alpha) * inputs[1])
+    
+class WCGANGP():
+    def __init__(self):
+        self.X_train = X_train
+        self.y_train = y_train
+        self.x_columns = self.X_train.shape[1]
+        self.latent_dim = 16
+        self.batch_size = 256
+        self.num_classes = 2
+
+        # Following parameter and optimizer set as recommended in paper
+        self.n_critic = 5
+        optimizer = RMSprop(lr=0.0005)
+
+        # Build the generator and critic
+        self.generator = self.build_generator()
+        self.critic = self.build_critic()
+
+        #-------------------------------
+        # Construct Computational Graph
+        #       for the Critic
+        #-------------------------------
+
+        # Freeze generator's layers while training critic
+        self.generator.trainable = False
+
+        # Image input (real sample)
+        real_img = Input(shape=(self.x_columns,))
+
+        # Noise input
+        z_disc = Input(shape=(self.latent_dim,))
+        label = Input(shape=(1,))
+        # Generate image based of noise (fake sample)
+        fake_img = self.generator([z_disc, label])
+
+        # Discriminator determines validity of the real and fake images
+        fake = self.critic([fake_img, label])
+        valid = self.critic([real_img, label])
+
+        # Construct weighted average between real and fake images
+        interpolated_img = RandomWeightedAverage()([real_img, fake_img])
+        # Determine validity of weighted sample
+        validity_interpolated = self.critic([interpolated_img, label])
+
+        # Use Python partial to provide loss function with additional
+        # 'averaged_samples' argument
+        partial_gp_loss = partial(self.gradient_penalty_loss,
+                          averaged_samples=interpolated_img)
+        partial_gp_loss.__name__ = 'gradient_penalty' # Keras requires function names
+
+        self.critic_model = Model(inputs=[real_img, label, z_disc],
+                            outputs=[valid, fake, validity_interpolated])
+        self.critic_model.compile(loss=[self.wasserstein_loss,
+                                              self.wasserstein_loss,
+                                              partial_gp_loss],
+                                        optimizer=optimizer,
+                                        loss_weights=[1, 1, 10])
+        #-------------------------------
+        # Construct Computational Graph
+        #         for Generator
+        #-------------------------------
+
+        # For the generator we freeze the critic's layers
+        self.critic.trainable = False
+        self.generator.trainable = True
+
+        # Sampled noise for input to generator
+        z_gen = Input(shape=(self.latent_dim,))
+        label = Input(shape=(1,))
+        # Generate images based of noise
+        img = self.generator([z_gen, label])
+        # Discriminator determines validity
+        valid = self.critic([img, label])
+        # Defines generator model
+        self.generator_model = Model([z_gen, label], valid)
+        self.generator_model.compile(loss=self.wasserstein_loss, optimizer=optimizer)
+
+
+    def gradient_penalty_loss(self, y_true, y_pred, averaged_samples):
+        """
+        Computes gradient penalty based on prediction and weighted real / fake samples
+        """
+        gradients = K.gradients(y_pred, averaged_samples)[0]
+        # compute the euclidean norm by squaring ...
+        gradients_sqr = K.square(gradients)
+        #   ... summing over the rows ...
+        gradients_sqr_sum = K.sum(gradients_sqr,
+                                  axis=np.arange(1, len(gradients_sqr.shape)))
+        #   ... and sqrt
+        gradient_l2_norm = K.sqrt(gradients_sqr_sum)
+        # compute lambda * (1 - ||grad||)^2 still for each single sample
+        gradient_penalty = K.square(1 - gradient_l2_norm)
+        # return the mean as loss over all the batch samples
+        return K.mean(gradient_penalty)
+
+
+    def wasserstein_loss(self, y_true, y_pred):
+        return K.mean(y_true * y_pred)
+    
+
+        
+    def build_generator(self):
+
+        model = Sequential()
+
+        model.add(Dense(512, input_dim=self.latent_dim+1))
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(BatchNormalization(momentum=0.8))
+#         model.add(Dense(512))
+#         model.add(LeakyReLU(alpha=0.2))
+#         model.add(BatchNormalization(momentum=0.8))
+        model.add(Dense(self.x_columns, activation='tanh'))
+
+        noise = Input(shape=(self.latent_dim,))
+        label = Input(shape=(1,),)
+        inputs = Concatenate()([noise, label])
+        X = model(inputs)
+
+        return Model([noise, label], X)
+
+    def build_critic(self):
+
+        model = Sequential()
+
+        model.add(Dense(512, input_dim=self.x_columns+1)) 
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(Dense(256))
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(Dense(1))
+
+
+        X = Input(shape=(self.x_columns,))
+        label = Input(shape=(1,), )
+        inputs = Concatenate()([X, label])
+        validity = model(inputs)
+
+        return Model([X, label], validity)
+
+    def train(self, epochs, sample_interval=100):
+
+        valid = -np.ones((self.batch_size, 1))
+        fake =  np.ones((self.batch_size, 1))
+        dummy = np.zeros((self.batch_size, 1)) # Dummy gt for gradient penalty
+        for epoch in range(epochs):
+
+            for _ in range(self.n_critic):
+
+                # ---------------------
+                #  Train Discriminator
+                # ---------------------
+
+                # Select a random batch of images
+                idx = np.random.randint(0, self.X_train.shape[0], self.batch_size)
+                imgs, labels = self.X_train[idx], self.y_train[idx]
+                # Sample generator input
+                noise = np.random.normal(0, 1, (self.batch_size, self.latent_dim))
+                # Train the critic
+                d_loss = self.critic_model.train_on_batch([imgs, labels, noise],
+                                                                [valid, fake, dummy])
+
+            # ---------------------
+            #  Train Generator
+            # ---------------------
+            sampled_labels = np.random.randint(0, self.num_classes, self.batch_size).reshape(-1,)
+            g_loss = self.generator_model.train_on_batch([noise, sampled_labels], valid)
+
+            # Plot the progress
+            if (epoch+1) % sample_interval == 0:
+                print ("%d [D loss: %f] [G loss: %f]" % (epoch, d_loss[0], g_loss))             
+
+if __name__ == '__main__':
+    wcgangp = WCGANGP()
+    wcgangp.train(epochs=2000)
+    
+def wcgangp_gen(X,y):
+    n_imb = X[y==0].shape[0]-X[y==1].shape[0]
+    a=np.random.normal(0, 1, (n_imb, wcgangp.latent_dim))
+    gen=wcgangp.generator.predict([a, ones((n_imb,1))])
+    X_gan = np.concatenate(((X, gen)), axis=0)
+    y_gan = np.concatenate(((y.reshape(-1, 1), ones((len(gen), 1)))), axis=0)
+    y_gan = y_gan.reshape(-1, )
+    return X_gan, y_gan
